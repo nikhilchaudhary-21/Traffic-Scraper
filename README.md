@@ -1,4 +1,4 @@
-# traffic Bulk Scraper
+# Traffic Bulk Scraper
 
 Scrapes traffic data for thousands of domains from traffic.cv and saves results to a CSV file.
 
