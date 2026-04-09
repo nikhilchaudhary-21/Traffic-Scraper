@@ -1,8 +1,8 @@
 """
-traffic.cv Bulk Scraper — Multi-Worker (v3)
+traffic.cv Bulk Scraper — Multi-Worker (v3.1)
+- Fixed: ZeroDivisionError when input.csv is empty
+- Added: Enhanced CSV reading and error handling
 - Each worker has its own Chrome window
-- No shared driver → no data mixing between workers
-- If CAPTCHA appears, press ENTER to continue
 - Output: output_1.csv (saved live after each domain)
 """
 
@@ -10,6 +10,7 @@ import csv
 import re
 import time
 import threading
+import queue
 from datetime import datetime
 from bs4 import BeautifulSoup
 from selenium import webdriver
@@ -18,7 +19,7 @@ from selenium.webdriver.chrome.options import Options
 # ── Config ─────────────────────────────────────────────────
 INPUT_FILE  = "input.csv"
 OUTPUT_FILE = "output_1.csv"
-NUM_WORKERS = 5    # number of Chrome windows (3 = safe, 5 = fast, 10 = risky)
+NUM_WORKERS = 5    # number of Chrome windows
 LOAD_WAIT   = 3    # seconds to wait for JS to render
 
 FIELDNAMES = [
@@ -41,13 +42,15 @@ err_count = 0
 def init_csv():
     """Create output file and write header row."""
     with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
-        csv.DictWriter(f, fieldnames=FIELDNAMES).writeheader()
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer.writeheader()
 
 def save_row(row):
     """Append a single result row to the output CSV (thread-safe)."""
     with write_lock:
         with open(OUTPUT_FILE, "a", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=FIELDNAMES).writerow(row)
+            writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+            writer.writerow(row)
 
 # ── Chrome Setup ───────────────────────────────────────────
 def make_driver():
@@ -57,6 +60,8 @@ def make_driver():
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument("--disable-blink-features=AutomationControlled")
+    # Uncomment the line below if you want it to run without opening windows:
+    # opts.add_argument("--headless") 
     return webdriver.Chrome(options=opts)
 
 # ── HTML Parser ────────────────────────────────────────────
@@ -92,12 +97,16 @@ def parse_html(html, domain):
 
     def y_to_visits(y):
         """Convert chart Y pixel coordinate to visit count."""
-        return f"{round((260 - float(y)) / 260 * 4_000_000 / 1000) * 1000:,.0f}"
+        try:
+            return f"{round((260 - float(y)) / 260 * 4_000_000 / 1000) * 1000:,.0f}"
+        except:
+            return "0"
 
     # Extract visit values for each month from chart path coordinates
     path_el = soup.find("path", class_=re.compile("recharts-area-curve"))
     if path_el:
         coords = re.findall(r"([0-9.]+),([0-9.]+)", path_el.get("d", ""))
+        # Standard X-axis anchors for the 3 months
         for idx, kx in enumerate([70, 307.5, 545]):
             if idx < len(x_labels) and coords:
                 closest = min(coords, key=lambda c: abs(float(c[0]) - kx))
@@ -116,19 +125,14 @@ def is_blocked(html):
 
 # ── Thread-safe Print ──────────────────────────────────────
 def safe_print(msg):
-    """Print without output getting mixed between threads."""
     with print_lock:
         print(msg, flush=True)
 
 # ── CAPTCHA Handler ────────────────────────────────────────
 def handle_captcha(driver, domain):
-    """
-    Pause all workers, let user solve CAPTCHA in browser,
-    then reload the page and return the new HTML.
-    """
     with captcha_lock:
-        safe_print(f"\n\n  CAPTCHA detected on: {domain}")
-        safe_print(f"  >>> Solve it in the browser, then press ENTER to continue: ")
+        safe_print(f"\n\n  [!] CAPTCHA detected on: {domain}")
+        safe_print(f"  >>> Solve it manually in the window, then press ENTER here to continue...")
         input()
         driver.get(f"https://traffic.cv/{domain}")
         time.sleep(LOAD_WAIT + 1)
@@ -136,28 +140,21 @@ def handle_captcha(driver, domain):
 
 # ── Worker Thread ──────────────────────────────────────────
 def worker(worker_id, domain_queue, total):
-    """
-    Each worker runs in its own thread with its own Chrome window.
-    Pulls domains from the shared queue until it's empty.
-    """
     global ok_count, err_count
-
     driver = make_driver()
     safe_print(f"  [Worker {worker_id}] Chrome started")
 
     while True:
-        # Get next domain from queue
         try:
             idx, domain = domain_queue.get_nowait()
-        except Exception:
-            break  # Queue is empty, worker is done
+        except queue.Empty:
+            break
 
         try:
             driver.get(f"https://traffic.cv/{domain}")
             time.sleep(LOAD_WAIT)
             html = driver.page_source
 
-            # Handle CAPTCHA if detected
             if is_blocked(html):
                 html = handle_captcha(driver, domain)
 
@@ -192,18 +189,31 @@ def worker(worker_id, domain_queue, total):
 
 # ── Main ───────────────────────────────────────────────────
 def main():
-    import queue
-
-    # Load domains from input CSV
+    # Load domains
     domains = []
-    with open(INPUT_FILE, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            d = row.get("url", "").strip()
-            if d:
-                domains.append(d)
+    try:
+        with open(INPUT_FILE, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                d = row.get("url", "").strip()
+                if d:
+                    domains.append(d)
+    except FileNotFoundError:
+        print(f"  ERROR: Could not find {INPUT_FILE} in this folder.")
+        return
 
-    total   = len(domains)
+    total = len(domains)
+    
+    # Critical Fix: Ensure we don't divide by zero or start with no work
+    if total == 0:
+        print("=" * 55)
+        print(f"  ERROR: No domains found in {INPUT_FILE}.")
+        print("  Make sure your CSV has a column header named 'url'.")
+        print("=" * 55)
+        return
+
     workers = min(NUM_WORKERS, total)
+    eta = round((total * (LOAD_WAIT + 1)) / workers / 60, 1)
 
     print("=" * 55)
     print(f"  traffic.cv Multi-Worker Scraper — {total} domains")
@@ -211,17 +221,15 @@ def main():
     print(f"  Input   : {INPUT_FILE}")
     print(f"  Output  : {OUTPUT_FILE}")
     print(f"  Workers : {workers} Chrome windows")
-    print(f"  ETA     : ~{round(total * LOAD_WAIT / workers / 60, 1)} min")
+    print(f"  ETA     : ~{eta} min")
     print("=" * 55)
 
     init_csv()
 
-    # Fill the shared queue with all domains
     domain_queue = queue.Queue()
     for idx, domain in enumerate(domains, 1):
         domain_queue.put((idx, domain))
 
-    # Launch worker threads — each gets its own Chrome window
     threads = []
     for wid in range(1, workers + 1):
         t = threading.Thread(
@@ -231,15 +239,14 @@ def main():
         )
         threads.append(t)
         t.start()
-        time.sleep(1.5)  # stagger Chrome launches to avoid startup conflicts
+        time.sleep(1.5) # Stagger window openings
 
-    # Wait for all workers to finish
     for t in threads:
         t.join()
 
     print(f"\n{'='*55}")
     print(f"  Done! Success: {ok_count} | Errors: {err_count}")
-    print(f"  Output saved to: {OUTPUT_FILE}")
+    print(f"  Results saved to: {OUTPUT_FILE}")
     print(f"{'='*55}")
 
 if __name__ == "__main__":
